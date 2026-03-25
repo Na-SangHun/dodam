@@ -1,0 +1,200 @@
+# --- 1. 라이브러리 임포트 ---
+import bluetooth
+import threading
+import time
+import requests
+import json
+from datetime import datetime
+
+# --- 2. 블루투스 설정 ---
+MEGA_MAC = "98:DA:60:0C:A3:98"
+UNO_MAC = "98:DA:60:0C:E4"
+
+# --- 3. ThingsBoard 및 로직 설정 ---
+THINGSBOARD_HOST = "http://192.168.0.19:8080"
+DEVICE_TOKEN = "szFl0aDp0BZOP5Rx76Mj"
+THINGSBOARD_UPLOAD_INTERVAL = 5
+
+# --- 4. 전역 변수 및 잠금 장치 ---
+latest_data = {
+    "temperature": None,
+    "humidity": None,
+    "gas": None,
+    "pir": None,
+    "door": None  
+}
+data_lock = threading.Lock()
+
+# --- 5. 로그 파일 설정 ---
+DOOR_LOG_FILE = "door_log.txt"
+MEGA_LOG_FILE = "mega_data_log.txt"
+UNO_LOG_FILE = "uno_data_log.txt"
+STATUS_LOG_FILE = "system_status_log.txt"
+
+# --- 6. 헬퍼 함수 ---
+
+# [함수 1] 문 열림 이벤트 발생 시, 파일에 시간 기록
+def log_door_event():
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_message = f"[{current_time}] 문 열림(DOOR_OPEN) 감지됨\n"
+    print("\033[91m" + log_message.strip() + "\033[0m")
+    try:
+        with open(DOOR_LOG_FILE, "a") as f:
+            f.write(log_message)
+    except Exception as e:
+        print(f"로그 파일 쓰기 오류: {e}")
+
+def log_system_status(status):
+    """ "EMERGENCY" 또는 "SAFE" 상태를 파일에 기록 """
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_message = f"[{current_time}] 시스템 상태 변경: {status}\n"
+   
+    # 쉘(터미널)에 상태별로 다른 색상으로 강조 표시
+    if status == "EMERGENCY":
+        # 붉은색, 굵게, 깜빡이게
+        print("\033[91m\033[1m\033[5m" + log_message.strip() + "\033[0m")
+    else:
+        # 녹색, 굵게
+        print("\033[92m\033[1m" + log_message.strip() + "\033[0m")
+   
+    try:
+        # 새로 정의한 STATUS_LOG_FILE에 기록
+        with open(STATUS_LOG_FILE, "a") as f:
+            f.write(log_message)
+    except Exception as e:
+        print(f"상태 로그 파일 쓰기 오류: {e}")
+
+       
+
+# [함수 2] 메가(환경 센서) 데이터 파싱
+def parse_mega_data(data):
+    """ 메가로부터 수신한 '온도,습도,가스' 데이터를 파싱 """
+    try:
+        # txt 저장 로직
+        current_time = datetime.now().strftime("%Y-%m-%d %H: %M: %S")
+        with open(MEGA_LOG_FILE, "a") as f:
+            f.write(f"[{current_time}]{data}\n")
+       
+        parts = data.split(',')
+        # 데이터 항목이 3개인지 확인
+        if len(parts) == 3:
+            with data_lock:
+                latest_data["temperature"] = int(parts[0])
+                latest_data["humidity"] = int(parts[1])
+                latest_data["gas"] = int(parts[2])
+            print(f"[Mega 수신] {data}")
+        else:
+            print(f"[Mega 파싱 오류] 예상 항목(3) 불일치: {data}")
+    except Exception as e:
+        print(f"[Mega 파싱 오류] {data} | {e}")
+
+# [함수 3] 우노(활동 센서) 데이터 파싱
+def parse_uno_data(data):
+    """ 우노로부터 수신한 'PIR,Door' 또는 'EMERGENCY' / 'STATUS_SAFE' 데이터를 파싱 """
+    try:
+        # 응급 버튼 관련 메시지 처리
+        if data == "EMERGENCY":
+            log_system_status("EMERGENCY")
+            with data_lock:
+                latest_data["status"] = "EMERGENCY"
+            return
+
+        elif data == "SAFE":
+            log_system_status("SAFE")    
+            with data_lock:
+                latest_data["status"] = "SAFE"
+            return
+
+        # 기존 "숫자,숫자" 형식 데이터 처리
+        parts = data.split(',')
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+           
+            pir_state = int(parts[0])
+            door_state = int(parts[1]) # 0:열림, 1:닫힘
+
+            print(f"[Uno 수신] PIR: {pir_state}, Door: {door_state}")
+
+            with data_lock:
+                is_door_open_event = (latest_data["door"] == 1 and door_state == 0)
+                latest_data["pir"] = pir_state
+                latest_data["door"] = door_state
+           
+            if is_door_open_event:
+                log_door_event()
+
+        else:
+            print(f"{data}")
+
+    except Exception as e:
+        print(f"[Uno 파싱 오류] {data} | {e}")
+# [함수 4] 각 블루투스 장치를 독립적으로 처리하는 스레드 함수
+def bluetooth_device_loop(device_name, device_mac, data_parser_func):
+    while True:
+        sock = None
+        try:
+            print(f"[{device_name}] 블루투스 연결 시도 중... ({device_mac})")
+            sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+            sock.connect((device_mac, 1))
+            sock.settimeout(None)
+            print(f"[{device_name}] 블루투스 연결 성공!")
+
+            buffer = ""
+            while True:
+                data = sock.recv(1024).decode('utf-8')
+                if not data:
+                    raise bluetooth.btcommon.BluetoothError("No data received, connection likely lost.")
+               
+                buffer += data
+               
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    if line:
+                        data_parser_func(line)
+               
+        except bluetooth.btcommon.BluetoothError as e:
+            print(f"[{device_name}] 연결 끊김 또는 오류: {e}")
+        except Exception as e:
+            print(f"[{device_name}] 처리 중 오류: {e}")
+        finally:
+            if sock:
+                sock.close()
+       
+        print(f"[{device_name}] 5초 후 재연결 시도...")
+        time.sleep(5)
+
+# --- 7. 메인 스레드 (ThingsBoard 전송) ---
+if __name__ == "__main__":
+    try:
+        mega_thread = threading.Thread(target=bluetooth_device_loop,
+                                       args=("Mega", MEGA_MAC, parse_mega_data))
+        mega_thread.daemon = True
+        mega_thread.start()
+
+        uno_thread = threading.Thread(target=bluetooth_device_loop,
+                                     args=("Uno", UNO_MAC, parse_uno_data))
+        uno_thread.daemon = True
+        uno_thread.start()
+
+        while True:
+            with data_lock:
+                payload = {key: value for key, value in latest_data.items() if value is not None}
+           
+            if payload:
+                try:
+                    url = f"{THINGSBOARD_HOST}/api/v1/{DEVICE_TOKEN}/telemetry"
+                    headers = {'Content-Type': 'application/json'}
+                    response = requests.post(url, data=json.dumps(payload), headers=headers)
+                    if response.status_code == 200:
+                        print(f"-> ThingsBoard 전송 성공: {payload}")
+                    else:
+                        print(f"[ThingsBoard 전송 오류] {response.status_code} {response.text}")
+                except Exception as e:
+                    print(f"[HTTP 전송 오류] {e}")
+
+            time.sleep(THINGSBOARD_UPLOAD_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("사용자에 의해 프로그램 종료.")
+    finally:
+        print("프로그램 종료.")
